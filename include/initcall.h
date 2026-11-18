@@ -12,8 +12,17 @@
 
 _Static_assert(EVT_COUNT < 256, "Can only support 256 event types with 8 bits");
 
+#ifdef APPLE_CRUMBS
+/* Debug: re-arm the watchdog per initcall so the reset delay encodes progress */
+void apple_crumb(void);
+#define INITCALL_CRUMB() apple_crumb()
+#else
+#define INITCALL_CRUMB()
+#endif
+
 #define INITCALL(_call) \
 	do { \
+		INITCALL_CRUMB(); \
 		if (_call()) { \
 			printf("%s(): initcall %s() failed\n", __func__, \
 			       #_call); \

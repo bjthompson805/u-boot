@@ -1,3 +1,4 @@
+#define DEBUG /* XXX M5 debug */
 // SPDX-License-Identifier: GPL-2.0+
 /*
  * Copyright (c) 2015 Google, Inc
@@ -625,6 +626,7 @@ void video_set_white_on_black(struct udevice *dev, bool white_on_black)
 	if (priv->white_on_black != white_on_black) {
 		priv->white_on_black = white_on_black;
 		video_set_default_colors(dev, false);
+	debug("%s: XXX rot@colors=%u fb=%p size=%x\n", __func__, priv->rot, priv->fb, priv->fb_size); /* XXX M5 debug */
 
 		video_clear(dev);
 	}
@@ -641,6 +643,7 @@ static int video_post_probe(struct udevice *dev)
 	struct udevice *cons;
 	int ret;
 
+	debug("%s: XXX rot@start=%u\n", __func__, priv->rot); /* XXX M5 debug */
 	/* Set up the line and display size */
 	priv->fb = map_sysmem(plat->base, plat->size);
 	if (!priv->line_length)
@@ -679,6 +682,7 @@ static int video_post_probe(struct udevice *dev)
 
 	if (!CONFIG_IS_ENABLED(NO_FB_CLEAR))
 		video_clear(dev);
+	debug("%s: XXX rot@clear=%u\n", __func__, priv->rot); /* XXX M5 debug */
 
 	/*
 	 * Create a text console device. For now we always do this, although
@@ -709,7 +713,7 @@ static int video_post_probe(struct udevice *dev)
 		drv_name = priv->vidconsole_drv_name;
 	ret = device_bind_driver(dev, drv_name, str, &cons);
 	if (ret) {
-		debug("%s: Cannot bind console driver\n", __func__);
+		debug("%s: Cannot bind console driver %s: %d\n", __func__, drv_name, ret); /* XXX M5 debug */
 		return ret;
 	}
 

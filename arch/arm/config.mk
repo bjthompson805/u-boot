@@ -111,6 +111,8 @@ endif
 
 # needed for relocation
 LDFLAGS_u-boot += -pie
+# .bss overlays .rela.dyn on purpose (see u-boot.lds); lld rejects the overlap otherwise
+LDFLAGS_u-boot += $(call ld-option,--no-check-sections)
 
 ifeq ($(CONFIG_ARM64),y)
 # U-Boot uses fixed 4K granules, so we force the linker to match.

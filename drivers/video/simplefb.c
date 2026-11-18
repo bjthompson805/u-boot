@@ -1,3 +1,4 @@
+#define DEBUG /* XXX M5 debug */
 // SPDX-License-Identifier: GPL-2.0+
 /*
  * (C) Copyright 2017 Rob Clark
@@ -16,10 +17,12 @@ static int simple_video_probe(struct udevice *dev)
 	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
 	ofnode node = dev_ofnode(dev);
 	const char *format;
+
+	debug("%s: XXX entry rot=%u priv=%p\n", __func__, uc_priv->rot, uc_priv); /* XXX M5 debug */
 	int ret;
 	fdt_addr_t base;
 	fdt_size_t size;
-	u32 width, height, stride, rot;
+	u32 width, height, stride, rot = 0; /* "rot" is optional: was read uninitialized */
 
 	base = dev_read_addr_size(dev, &size);
 	if (base == FDT_ADDR_T_NONE) {

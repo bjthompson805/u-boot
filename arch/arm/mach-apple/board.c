@@ -752,7 +752,87 @@ static struct mm_region t8122_mem_map[] = {
 	}
 };
 
+/* M5, ranges from the J815 ADT /arm-io ranges */
+static struct mm_region t8142_mem_map[] = {
+	{
+		/* I/O (incl. NVMe) */
+		.virt = 0x200000000,
+		.phys = 0x200000000,
+		.size = 16UL * SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* I/O ATC */
+		.virt = 0x800000000,
+		.phys = 0x800000000,
+		.size = 0xe80000000,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* PCIE */
+		.virt = 0x1c00000000,
+		.phys = 0x1c00000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRE) |
+			 PTE_BLOCK_INNER_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* RAM */
+		.virt = 0x10000000000,
+		.phys = 0x10000000000,
+		.size = 8UL * SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
+			 PTE_BLOCK_INNER_SHARE
+	}, {
+		/* Framebuffer */
+		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+			 PTE_BLOCK_INNER_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* List terminator */
+		0,
+	}
+};
+
 struct mm_region *mem_map;
+
+#ifdef APPLE_CRUMBS
+/*
+ * Debug breadcrumbs for boards with no console: each call re-arms the
+ * watchdog with a timeout of 8 + 1.2 * n seconds, so the time until the
+ * reset tells the host how far startup got. Physical address works both
+ * before and after the MMU is enabled (I/O is identity mapped).
+ * In .data: pre-relocation .bss overlaps the appended FDT.
+ */
+#define CRUMB_WDT	0x3882b0000UL
+static unsigned int crumb_n __section(".data") = 1;
+
+void apple_crumb(void)
+{
+	unsigned long ticks = (8000UL + 1200UL * crumb_n++) * 24000UL;
+
+	writel(0, (void *)(CRUMB_WDT + 0x1c));
+	writel(ticks, (void *)(CRUMB_WDT + 0x14));
+	writel(0, (void *)(CRUMB_WDT + 0x10));
+	writel(4, (void *)(CRUMB_WDT + 0x1c));
+}
+
+void apple_crumb_skip(unsigned int n)
+{
+	crumb_n += n;
+}
+
+/* Called first thing from the exception handlers: crumb = 70 + ESR.EC, then stop */
+void apple_crumb_exc(unsigned long esr)
+{
+	crumb_n = 70 + ((esr >> 26) & 0x3f);
+	apple_crumb();
+	for (;;)
+		;
+}
+#endif
 
 int board_init(void)
 {
@@ -761,7 +841,16 @@ int board_init(void)
 
 int dram_init(void)
 {
+#ifdef APPLE_CRUMBS
+	int ret;
+
+	apple_crumb();
+	ret = fdtdec_setup_mem_size_base();
+	apple_crumb();
+	return ret;
+#else
 	return fdtdec_setup_mem_size_base();
+#endif
 }
 
 int dram_init_banksize(void)
@@ -801,6 +890,8 @@ void build_mem_map(void)
 		mem_map = t6022_mem_map;
 	else if (of_machine_is_compatible("apple,t8122"))
 		mem_map = t8122_mem_map;
+	else if (of_machine_is_compatible("apple,t8142"))
+		mem_map = t8142_mem_map;
 	else
 		panic("Unsupported SoC\n");
 
@@ -842,9 +933,45 @@ void build_mem_map(void)
 void enable_caches(void)
 {
 	build_mem_map();
+#ifdef APPLE_CRUMBS
+	apple_crumb();
+#endif
+
+	/*
+	 * M5 experiment: U-Boot relocated itself with caches off, but stale
+	 * lines from m1n1 (whose set/way clean doesn't reach the shared L2)
+	 * may still cover that memory. Discard them by VA before any cache
+	 * is enabled.
+	 */
+#ifdef APPLE_CRUMBS
+	{
+		/* Probe: is an SError pending? (+10 on the crumb counter if so) */
+		u64 isr;
+
+		asm volatile("mrs %0, isr_el1" : "=r" (isr));
+		if (isr & BIT(8))
+			apple_crumb_skip(10);
+		/* Probe: is ram_top above m1n1's usable top (0x103db5f8000)? (+20) */
+		if (gd->ram_top > 0x103db5f8000UL)
+			apple_crumb_skip(20);
+		apple_crumb();
+		asm volatile("dsb sy\n\tisb" ::: "memory");
+		apple_crumb();
+	}
+#endif
+	invalidate_dcache_range(gd->ram_top - SZ_64M, gd->ram_top);
+#ifdef APPLE_CRUMBS
+	apple_crumb();
+#endif
 
 	icache_enable();
+#ifdef APPLE_CRUMBS
+	apple_crumb();
+#endif
 	dcache_enable();
+#ifdef APPLE_CRUMBS
+	apple_crumb();
+#endif
 }
 
 u64 get_page_table_size(void)

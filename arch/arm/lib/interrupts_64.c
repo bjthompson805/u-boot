@@ -5,6 +5,13 @@
  */
 
 #include <asm/esr.h>
+
+#ifdef APPLE_CRUMBS
+void apple_crumb_exc(unsigned long esr);
+#define CRUMB_EXC(r) apple_crumb_exc((r)->esr)
+#else
+#define CRUMB_EXC(r)
+#endif
 #include <asm/global_data.h>
 #include <asm/ptrace.h>
 #include <irq_func.h>
@@ -145,6 +152,7 @@ static bool smh_emulate_trap(struct pt_regs *regs)
  */
 void do_bad_sync(struct pt_regs *pt_regs)
 {
+	CRUMB_EXC(pt_regs);
 	efi_restore_gd();
 	printf("Bad mode in \"Synchronous Abort\" handler, esr 0x%08lx\n",
 	       pt_regs->esr);
@@ -158,6 +166,7 @@ void do_bad_sync(struct pt_regs *pt_regs)
  */
 void do_bad_irq(struct pt_regs *pt_regs)
 {
+	CRUMB_EXC(pt_regs);
 	efi_restore_gd();
 	printf("Bad mode in \"Irq\" handler, esr 0x%08lx\n", pt_regs->esr);
 	show_regs(pt_regs);
@@ -170,6 +179,7 @@ void do_bad_irq(struct pt_regs *pt_regs)
  */
 void do_bad_fiq(struct pt_regs *pt_regs)
 {
+	CRUMB_EXC(pt_regs);
 	efi_restore_gd();
 	printf("Bad mode in \"Fiq\" handler, esr 0x%08lx\n", pt_regs->esr);
 	show_regs(pt_regs);
@@ -182,6 +192,7 @@ void do_bad_fiq(struct pt_regs *pt_regs)
  */
 void do_bad_error(struct pt_regs *pt_regs)
 {
+	CRUMB_EXC(pt_regs);
 	efi_restore_gd();
 	printf("Bad mode in \"Error\" handler, esr 0x%08lx\n", pt_regs->esr);
 	show_regs(pt_regs);
@@ -194,6 +205,7 @@ void do_bad_error(struct pt_regs *pt_regs)
  */
 void do_sync(struct pt_regs *pt_regs)
 {
+	CRUMB_EXC(pt_regs);
 	if (CONFIG_IS_ENABLED(SEMIHOSTING_FALLBACK) &&
 	    smh_emulate_trap(pt_regs))
 		return;
@@ -211,6 +223,7 @@ void do_sync(struct pt_regs *pt_regs)
  */
 void do_irq(struct pt_regs *pt_regs)
 {
+	CRUMB_EXC(pt_regs);
 	efi_restore_gd();
 	printf("\"Irq\" handler, esr 0x%08lx\n", pt_regs->esr);
 	show_regs(pt_regs);
@@ -223,6 +236,7 @@ void do_irq(struct pt_regs *pt_regs)
  */
 void do_fiq(struct pt_regs *pt_regs)
 {
+	CRUMB_EXC(pt_regs);
 	efi_restore_gd();
 	printf("\"Fiq\" handler, esr 0x%08lx\n", pt_regs->esr);
 	show_regs(pt_regs);
@@ -238,6 +252,7 @@ void do_fiq(struct pt_regs *pt_regs)
  */
 void __weak do_error(struct pt_regs *pt_regs)
 {
+	CRUMB_EXC(pt_regs);
 	efi_restore_gd();
 	printf("\"Error\" handler, esr 0x%08lx\n", pt_regs->esr);
 	show_regs(pt_regs);
