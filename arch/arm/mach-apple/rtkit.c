@@ -263,6 +263,8 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout)
 		}
 	}
 
+	if (endpoint == APPLE_RTKIT_EP_DEBUG)
+		return 0;
 	if (endpoint != APPLE_RTKIT_EP_MGMT) {
 		printf("%s: unexpected endpoint %d\n", __func__, endpoint);
 		return -EINVAL;
@@ -283,7 +285,7 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout)
 	}
 }
 
-int apple_rtkit_boot(struct apple_rtkit *rtk)
+int apple_rtkit_boot_state(struct apple_rtkit *rtk, int pwrstate)
 {
 	struct apple_mbox_msg msg;
 	int endpoints[256];
@@ -297,7 +299,7 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 
 	/* Wakup the IOP. */
 	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE) |
-		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_ON);
+		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, pwrstate);
 	msg.msg1 = APPLE_RTKIT_EP_MGMT;
 	ret = mbox_send(rtk->chan, &msg);
 	if (ret < 0)
@@ -385,19 +387,16 @@ wait_epmap:
 		goto wait_epmap;
 
 	for (i = 0; i < nendpoints; i++) {
-		/* Start only necessary endpoints. The syslog endpoint is
-		 * particularly noisy and its message can't easily be handled
-		 * within U-Boot.
-		 */
-		switch (endpoints[i]) {
-		case APPLE_RTKIT_EP_MGMT:
-		case APPLE_RTKIT_EP_SYSLOG:
-		case APPLE_RTKIT_EP_DEBUG:
-		case APPLE_RTKIT_EP_TRACEKIT:
+		endpoint = endpoints[i];
+		if (endpoint == APPLE_RTKIT_EP_MGMT ||
+		    endpoint == APPLE_RTKIT_EP_TRACEKIT)
 			continue;
-		default:
-			break;
-		}
+		if (pwrstate != APPLE_RTKIT_PWR_STATE_INIT &&
+		    (endpoint == APPLE_RTKIT_EP_SYSLOG ||
+		     endpoint == APPLE_RTKIT_EP_DEBUG))
+			continue;
+		if (pwrstate == APPLE_RTKIT_PWR_STATE_INIT && endpoint >= 0x20)
+			continue;
 
 		/* Request endpoint. */
 		msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_STARTEP) |
@@ -412,13 +411,18 @@ wait_epmap:
 	rtk->iop_pwr = APPLE_RTKIT_PWR_STATE_SLEEP;
 	rtk->ap_pwr = APPLE_RTKIT_PWR_STATE_QUIESCED;
 
-	while (rtk->iop_pwr != APPLE_RTKIT_PWR_STATE_ON) {
+	while ((rtk->iop_pwr & 0xff) != APPLE_RTKIT_PWR_STATE_ON) {
 		ret = apple_rtkit_poll(rtk, TIMEOUT_1SEC_US);
 		if (ret < 0)
 			return ret;
 	}
 
 	return 0;
+}
+
+int apple_rtkit_boot(struct apple_rtkit *rtk)
+{
+	return apple_rtkit_boot_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
 }
 
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, int pwrstate)

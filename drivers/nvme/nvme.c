@@ -21,7 +21,7 @@
 #define NVME_AQ_DEPTH		2
 #define NVME_SQ_SIZE(depth)	(depth * sizeof(struct nvme_command))
 #define NVME_CQ_SIZE(depth)	(depth * sizeof(struct nvme_completion))
-#define NVME_CQ_ALLOCATION	ALIGN(NVME_CQ_SIZE(NVME_Q_DEPTH), \
+#define NVME_CQ_ALLOCATION(depth) ALIGN(NVME_CQ_SIZE(depth), \
 				      ARCH_DMA_MINALIGN)
 #define ADMIN_TIMEOUT		60
 #define IO_TIMEOUT		30
@@ -51,6 +51,8 @@ static int nvme_wait_csts(struct nvme_dev *dev, u32 mask, u32 val)
 
 	/* Timeout field in the CAP register is in 500 millisecond units */
 	timeout = NVME_CAP_TIMEOUT(dev->cap) * 500;
+	if (dev->fixed_io_queue)
+		timeout = min(timeout, 2000);
 
 	start = get_timer(0);
 	while (get_timer(start) < timeout) {
@@ -144,7 +146,7 @@ static u16 nvme_read_completion_status(struct nvme_queue *nvmeq, u16 index)
 	 * as the cache line should never become dirty.
 	 */
 	ulong start = (ulong)&nvmeq->cqes[0];
-	ulong stop = start + NVME_CQ_ALLOCATION;
+	ulong stop = start + NVME_CQ_ALLOCATION(nvmeq->q_depth);
 
 	invalidate_dcache_range(start, stop);
 
@@ -189,7 +191,8 @@ static int nvme_submit_sync_cmd(struct nvme_queue *nvmeq,
 	ulong start_time;
 	ulong timeout_us = timeout * 100000;
 
-	cmd->common.command_id = nvme_get_cmd_id();
+	cmd->common.command_id = nvmeq->dev->sq_slot_is_cid ?
+		nvmeq->sq_tail : nvme_get_cmd_id();
 	nvme_submit_cmd(nvmeq, cmd);
 
 	start_time = timer_get_us();
@@ -200,7 +203,9 @@ static int nvme_submit_sync_cmd(struct nvme_queue *nvmeq,
 			break;
 		if (timeout_us > 0 && (timer_get_us() - start_time)
 		    >= timeout_us) {
-			pr_warn("nvme: cmd %#x timed out\n", cmd->common.command_id);
+			printf("nvme: opcode %#x CID %u timeout, CC %#x CSTS %#x CQE %#x\n",
+			       cmd->common.opcode, le16_to_cpu(cmd->common.command_id),
+			       readl(&nvmeq->dev->bar->cc), readl(&nvmeq->dev->bar->csts), status);
 			return -ETIMEDOUT;
 		}
 	}
@@ -211,8 +216,8 @@ static int nvme_submit_sync_cmd(struct nvme_queue *nvmeq,
 
 	status >>= 1;
 	if (status) {
-		printf("ERROR: status = %x, phase = %d, head = %d\n",
-		       status, phase, head);
+		printf("nvme: queue %u opcode %#x status %#x\n",
+		       nvmeq->qid, cmd->common.opcode, status);
 		status = 0;
 		if (++head == nvmeq->q_depth) {
 			head = 0;
@@ -250,17 +255,18 @@ static struct nvme_queue *nvme_alloc_queue(struct nvme_dev *dev,
 					   int qid, int depth)
 {
 	struct nvme_ops *ops;
+	unsigned int alignment = dev->queue_alignment ?: 4096;
 	struct nvme_queue *nvmeq = malloc(sizeof(*nvmeq));
 	if (!nvmeq)
 		return NULL;
 	memset(nvmeq, 0, sizeof(*nvmeq));
 
-	nvmeq->cqes = (void *)memalign(4096, NVME_CQ_ALLOCATION);
+	nvmeq->cqes = (void *)memalign(alignment, NVME_CQ_ALLOCATION(depth));
 	if (!nvmeq->cqes)
 		goto free_nvmeq;
 	memset((void *)nvmeq->cqes, 0, NVME_CQ_SIZE(depth));
 
-	nvmeq->sq_cmds = (void *)memalign(4096, NVME_SQ_SIZE(depth));
+	nvmeq->sq_cmds = (void *)memalign(alignment, NVME_SQ_SIZE(depth));
 	if (!nvmeq->sq_cmds)
 		goto free_queue;
 	memset((void *)nvmeq->sq_cmds, 0, NVME_SQ_SIZE(depth));
@@ -361,7 +367,7 @@ static void nvme_init_queue(struct nvme_queue *nvmeq, u16 qid)
 	nvmeq->q_db = &dev->dbs[qid * 2 * dev->db_stride];
 	memset((void *)nvmeq->cqes, 0, NVME_CQ_SIZE(nvmeq->q_depth));
 	flush_dcache_range((ulong)nvmeq->cqes,
-			   (ulong)nvmeq->cqes + NVME_CQ_ALLOCATION);
+			   (ulong)nvmeq->cqes + NVME_CQ_ALLOCATION(nvmeq->q_depth));
 	dev->online_queues++;
 }
 
@@ -388,15 +394,31 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 		page_shift = dev_page_max;
 	}
 
-	result = nvme_disable_ctrl(dev);
-	if (result < 0)
-		return result;
+	if (dev->fixed_io_queue)
+		printf("nvme: before disable CC %#x CSTS %#x\n",
+		       readl(&dev->bar->cc), readl(&dev->bar->csts));
+	/* ANS inherits its queue entry format from firmware. */
+	if (dev->fixed_io_queue)
+		dev->ctrl_config = readl(&dev->bar->cc);
+	if (!dev->fixed_io_queue || (dev->ctrl_config & NVME_CC_ENABLE)) {
+		result = nvme_disable_ctrl(dev);
+		if (result < 0)
+			return result;
+	}
 
 	nvmeq = dev->queues[NVME_ADMIN_Q];
 	if (!nvmeq) {
-		nvmeq = nvme_alloc_queue(dev, 0, NVME_AQ_DEPTH);
+		nvmeq = nvme_alloc_queue(dev, 0, dev->queue_depth_override ?
+					 dev->q_depth : NVME_AQ_DEPTH);
 		if (!nvmeq)
 			return -ENOMEM;
+	}
+
+	/* ANS needs both NVMMU TCB base registers set before CC.EN. */
+	if (dev->fixed_io_queue && !dev->queues[NVME_IO_Q] &&
+	    !nvme_alloc_queue(dev, NVME_IO_Q, dev->q_depth)) {
+		result = -ENOMEM;
+		goto free_nvmeq;
 	}
 
 	aqa = nvmeq->q_depth - 1;
@@ -404,18 +426,26 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 
 	dev->page_size = 1 << page_shift;
 
-	dev->ctrl_config = NVME_CC_CSS_NVM;
-	dev->ctrl_config |= (page_shift - 12) << NVME_CC_MPS_SHIFT;
-	dev->ctrl_config |= NVME_CC_ARB_RR | NVME_CC_SHN_NONE;
-	dev->ctrl_config |= NVME_CC_IOSQES | NVME_CC_IOCQES;
+	if (!dev->fixed_io_queue) {
+		dev->ctrl_config = NVME_CC_CSS_NVM;
+		dev->ctrl_config |= (page_shift - 12) << NVME_CC_MPS_SHIFT;
+		dev->ctrl_config |= NVME_CC_ARB_RR | NVME_CC_SHN_NONE;
+		dev->ctrl_config |= NVME_CC_IOSQES | NVME_CC_IOCQES;
+	}
 
 	writel(aqa, &dev->bar->aqa);
 	nvme_writeq((ulong)nvmeq->sq_cmds, &dev->bar->asq);
 	nvme_writeq((ulong)nvmeq->cqes, &dev->bar->acq);
 
+	if (dev->fixed_io_queue)
+		printf("nvme: before enable CC %#x CSTS %#x\n",
+		       readl(&dev->bar->cc), readl(&dev->bar->csts));
 	result = nvme_enable_ctrl(dev);
-	if (result)
+	if (result) {
+		printf("nvme: enable failed: CC %#x CSTS %#x\n",
+		       readl(&dev->bar->cc), readl(&dev->bar->csts));
 		goto free_nvmeq;
+	}
 
 	nvmeq->cq_vector = 0;
 
@@ -433,7 +463,10 @@ static int nvme_alloc_cq(struct nvme_dev *dev, u16 qid,
 			    struct nvme_queue *nvmeq)
 {
 	struct nvme_command c;
-	int flags = NVME_QUEUE_PHYS_CONTIG | NVME_CQ_IRQ_ENABLED;
+	int flags = NVME_QUEUE_PHYS_CONTIG;
+
+	if (!dev->fixed_io_queue)
+		flags |= NVME_CQ_IRQ_ENABLED;
 
 	memset(&c, 0, sizeof(c));
 	c.create_cq.opcode = nvme_admin_create_cq;
@@ -450,7 +483,10 @@ static int nvme_alloc_sq(struct nvme_dev *dev, u16 qid,
 			    struct nvme_queue *nvmeq)
 {
 	struct nvme_command c;
-	int flags = NVME_QUEUE_PHYS_CONTIG | NVME_SQ_PRIO_MEDIUM;
+	int flags = NVME_QUEUE_PHYS_CONTIG;
+
+	if (!dev->fixed_io_queue)
+		flags |= NVME_SQ_PRIO_MEDIUM;
 
 	memset(&c, 0, sizeof(c));
 	c.create_sq.opcode = nvme_admin_create_sq;
@@ -555,17 +591,24 @@ int nvme_set_features(struct nvme_dev *dev, unsigned fid, unsigned dword11,
 static int nvme_create_queue(struct nvme_queue *nvmeq, int qid)
 {
 	struct nvme_dev *dev = nvmeq->dev;
+	const struct nvme_ops *ops = dev->udev->driver->ops;
 	int result;
 
 	nvmeq->cq_vector = qid - 1;
 	result = nvme_alloc_cq(dev, qid, nvmeq);
-	if (result < 0)
+	if (result < 0) {
+		printf("nvme: create CQ %u failed: %d\n", qid, result);
 		goto release_ret;
+	}
 
 	result = nvme_alloc_sq(dev, qid, nvmeq);
-	if (result < 0)
+	if (result < 0) {
+		printf("nvme: create SQ %u failed: %d\n", qid, result);
 		goto release_cq;
+	}
 
+	if (ops && ops->io_queue_created)
+		ops->io_queue_created(nvmeq);
 	nvme_init_queue(nvmeq, qid);
 
 	return result;
@@ -618,10 +661,12 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	int result;
 
 	nr_io_queues = 1;
-	result = nvme_set_queue_count(dev, nr_io_queues);
-	if (result <= 0) {
-		log_debug("Cannot set queue count (err=%dE)\n", result);
-		return result;
+	if (!dev->fixed_io_queue) {
+		result = nvme_set_queue_count(dev, nr_io_queues);
+		if (result <= 0) {
+			log_debug("Cannot set queue count (err=%dE)\n", result);
+			return result;
+		}
 	}
 
 	dev->max_qid = nr_io_queues;
@@ -867,11 +912,15 @@ int nvme_init(struct udevice *udev)
 	memset(ndev->queues, 0, NVME_Q_NUM * sizeof(struct nvme_queue *));
 
 	ndev->cap = nvme_readq(&ndev->bar->cap);
-	ndev->q_depth = min_t(int, NVME_CAP_MQES(ndev->cap) + 1, NVME_Q_DEPTH);
+	ndev->q_depth = min_t(int, NVME_CAP_MQES(ndev->cap) + 1,
+			      ndev->queue_depth_override ?: NVME_Q_DEPTH);
 	ndev->db_stride = 1 << NVME_CAP_STRIDE(ndev->cap);
 	ndev->dbs = ((void __iomem *)ndev->bar) + 4096;
 
 	ret = nvme_configure_admin_queue(ndev);
+	printf("nvme: admin queue status %d CAP %#llx AQA %#x ASQ %#llx ACQ %#llx\n",
+	       ret, ndev->cap, readl(&ndev->bar->aqa),
+	       nvme_readq(&ndev->bar->asq), nvme_readq(&ndev->bar->acq));
 	if (ret) {
 		log_debug("Unable to configure admin queue (err=%dE)\n", ret);
 		goto free_queue;
@@ -887,13 +936,19 @@ int nvme_init(struct udevice *udev)
 	ndev->prp_entry_num = MAX_PRP_POOL >> 3;
 
 	ret = nvme_setup_io_queues(ndev);
+	printf("nvme: I/O queue status %d\n", ret);
 	if (ret) {
 		log_debug("Unable to setup I/O queues(err=%dE)\n", ret);
 		goto free_prp_pool;
 	}
 
-	nvme_get_info_from_identify(ndev);
+	ret = nvme_get_info_from_identify(ndev);
+	if (ret) {
+		printf("nvme: identify controller failed: %d\n", ret);
+		goto free_prp_pool;
+	}
 
+	printf("nvme: controller reports %u namespaces\n", ndev->nn);
 	/* Create a blk device for each namespace */
 
 	id = memalign(ndev->page_size, sizeof(struct nvme_id_ns));
@@ -907,10 +962,10 @@ int nvme_init(struct udevice *udev)
 		char name[20];
 
 		memset(id, 0, sizeof(*id));
-		if (nvme_identify(ndev, i, 0, (dma_addr_t)(long)id)) {
-			ret = -EIO;
+		ret = nvme_identify(ndev, i, 0, (dma_addr_t)(long)id);
+		printf("nvme: identify namespace %d status %d\n", i, ret);
+		if (ret)
 			goto free_id;
-		}
 
 		/* skip inactive namespace */
 		if (!id->nsze)
@@ -935,6 +990,7 @@ int nvme_init(struct udevice *udev)
 		}
 
 		ret = blk_probe_or_unbind(ns_udev);
+		printf("nvme: block probe for namespace %d status %d\n", i, ret);
 		if (ret)
 			goto free_id;
 	}

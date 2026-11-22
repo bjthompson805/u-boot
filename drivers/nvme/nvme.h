@@ -596,6 +596,10 @@ enum {
 
 /* Represents an NVM Express device. Each nvme_dev is a PCI function. */
 struct nvme_dev {
+	bool fixed_io_queue; /* One I/O queue, with no Set Features negotiation. */
+	bool sq_slot_is_cid; /* Linear SQ indexes tasks by command ID. */
+	u16 queue_depth_override;
+	u16 queue_alignment;
 	struct udevice *udev;
 	struct list_head node;
 	struct nvme_queue **queues;
@@ -672,6 +676,13 @@ struct nvme_ops {
 	 * Return: 0 if OK, -ve on error
 	 */
 	int (*setup_queue)(struct nvme_queue *nvmeq);
+	/**
+	 * io_queue_created - Finish vendor-specific I/O queue setup after the
+	 * Create CQ and Create SQ commands have completed.
+	 *
+	 * @nvmeq: NVM Express I/O queue
+	 */
+	void (*io_queue_created)(struct nvme_queue *nvmeq);
 	/**
 	 * submit_cmd - Controller-specific NVM Express command submission.
 	 *
