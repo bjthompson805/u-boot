@@ -1,4 +1,3 @@
-#define DEBUG /* XXX M5 debug */
 // SPDX-License-Identifier: GPL-2.0+
 /*
  * (C) Copyright 2017 Rob Clark
