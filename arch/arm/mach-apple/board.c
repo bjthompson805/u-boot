@@ -11,6 +11,7 @@
 #include <nvme.h>
 #include <part.h>
 
+#include <asm/arch/rtkit.h>
 #include <asm/armv8/mmu.h>
 #include <asm/global_data.h>
 #include <asm/io.h>
@@ -1089,6 +1090,16 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	struct udevice *dev;
 	const char *stdoutname;
 	int node, ret;
+
+	/*
+	 * A coprocessor handed over running (the M5 MTP behind the keyboard)
+	 * must be described to the OS; a failure only costs it the session.
+	 */
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB)) {
+		ret = apple_rtkit_helper_fdt_fixup(blob);
+		if (ret)
+			printf("MTP: OS handoff not described (%d)\n", ret);
+	}
 
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point

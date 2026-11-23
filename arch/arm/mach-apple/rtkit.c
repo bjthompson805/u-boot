@@ -4,6 +4,7 @@
  * (C) Copyright 2021 Copyright The Asahi Linux Contributors
  */
 
+#include <dm/device.h>
 #include <mailbox.h>
 #include <malloc.h>
 
@@ -61,7 +62,7 @@
 /* Messages for internal endpoints. */
 #define APPLE_RTKIT_BUFFER_REQUEST 1
 #define APPLE_RTKIT_BUFFER_REQUEST_SIZE GENMASK(51, 44)
-#define APPLE_RTKIT_BUFFER_REQUEST_IOVA GENMASK(41, 0)
+#define APPLE_RTKIT_BUFFER_REQUEST_IOVA GENMASK(43, 0)
 
 #define TIMEOUT_1SEC_US 1000000
 
@@ -98,6 +99,26 @@ struct apple_rtkit *apple_rtkit_init(struct mbox_chan *chan, void *cookie,
 	return rtk;
 }
 
+/* Snapshot protocol descriptors before the next stage starts receiving. */
+int apple_rtkit_get_buffers(struct apple_rtkit *rtk,
+			   struct apple_rtkit_buffer *buffers, size_t count)
+{
+	const struct apple_rtkit_buffer *live[] = {
+		&rtk->crashlog_buffer, &rtk->syslog_buffer,
+		&rtk->ioreport_buffer, &rtk->oslog_buffer,
+	};
+	int n = 0;
+
+	for (int i = 0; i < ARRAY_SIZE(live); i++) {
+		if (!live[i]->size)
+			continue;
+		if (n >= count)
+			return -ENOSPC;
+		buffers[n++] = *live[i];
+	}
+	return n;
+}
+
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
 	if (rtk->shmem_destroy) {
@@ -125,6 +146,7 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 static int rtkit_handle_buf_req(struct apple_rtkit *rtk, int endpoint, struct apple_mbox_msg *msg)
 {
 	struct apple_rtkit_buffer *buf;
+	struct apple_rtkit_buffer request = { 0 };
 	int ret;
 
 	switch (endpoint) {
@@ -147,39 +169,50 @@ static int rtkit_handle_buf_req(struct apple_rtkit *rtk, int endpoint, struct ap
 
 	switch (endpoint) {
 	case APPLE_RTKIT_EP_OSLOG:
-		buf->size = FIELD_GET(APPLE_RTKIT_OSLOG_SIZE, msg->msg0);
-		buf->dva = FIELD_GET(APPLE_RTKIT_OSLOG_IOVA, msg->msg0 << 12);
+		request.size = FIELD_GET(APPLE_RTKIT_OSLOG_SIZE, msg->msg0);
+		request.dva = FIELD_GET(APPLE_RTKIT_OSLOG_IOVA, msg->msg0) << 12;
 		break;
 	default:
-		buf->size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg->msg0) << 12;
-		buf->dva = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg->msg0);
+		request.size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE,
+					 msg->msg0) << 12;
+		request.dva = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA,
+					msg->msg0);
 		break;
 	}
+	request.is_mapped = !!request.dva;
+	request.endpoint = endpoint;
 
-	if (buf->size == 0) {
+	if (!request.size) {
 		printf("%s: unexpected request for buffer without size\n", __func__);
-		return -1;
+		return -EINVAL;
 	}
-
-	buf->dva = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg->msg0);
-	buf->is_mapped = !!buf->dva;
-	buf->endpoint = endpoint;
+	/* Linux retains live buffers across duplicate requests. */
+	if (buf->size) {
+		if (request.size != buf->size ||
+		    (request.dva != buf->dva &&
+		     (request.dva || buf->is_mapped)))
+			return -EBUSY;
+		goto reply;
+	}
+	if (request.is_mapped && !rtk->shmem_setup)
+		return -EINVAL;
 
 	if (rtk->shmem_setup) {
-		ret = rtk->shmem_setup(rtk->cookie, buf);
+		ret = rtk->shmem_setup(rtk->cookie, &request);
 		if (ret < 0) {
-			printf("%s: shmen_setup failed for endpoint %d\n", __func__,
-			       endpoint);
+			printf("%s: shmem_setup failed for endpoint %d (%d)\n",
+			       __func__, endpoint, ret);
 			return ret;
 		}
-	} else if (!buf->is_mapped){
-		buf->buffer = memalign(SZ_16K, ALIGN(buf->size, SZ_16K));
-		if (!buf->buffer)
+	} else {
+		request.buffer = memalign(SZ_16K, ALIGN(request.size, SZ_16K));
+		if (!request.buffer)
 			return -ENOMEM;
-
-		buf->dva = (u64)buf->buffer;
+		request.dva = (u64)request.buffer;
 	}
+	*buf = request;
 
+reply:
 	if (!buf->is_mapped) {
 		/* oslog uses different fields */
 		if (endpoint == APPLE_RTKIT_EP_OSLOG) {
@@ -194,7 +227,8 @@ static int rtkit_handle_buf_req(struct apple_rtkit *rtk, int endpoint, struct ap
 			msg->msg0 |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_IOVA, buf->dva);
 		}
 
-		return mbox_send(rtk->chan, msg);
+		ret = mbox_send(rtk->chan, msg);
+		return ret;
 	}
 
 	return 0;
@@ -262,9 +296,10 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout)
 			return 0;
 		}
 	}
-
-	if (endpoint == APPLE_RTKIT_EP_DEBUG)
+	if (endpoint == APPLE_RTKIT_EP_DEBUG ||
+	    endpoint == APPLE_RTKIT_EP_TRACEKIT)
 		return 0;
+
 	if (endpoint != APPLE_RTKIT_EP_MGMT) {
 		printf("%s: unexpected endpoint %d\n", __func__, endpoint);
 		return -EINVAL;
@@ -285,7 +320,65 @@ int apple_rtkit_poll(struct apple_rtkit *rtk, ulong timeout)
 	}
 }
 
-int apple_rtkit_boot_state(struct apple_rtkit *rtk, int pwrstate)
+/*
+ * T6050: start the system endpoints the way m1n1 and Linux do there: debug,
+ * crashlog, syslog, ioreport, oslog in that order, and nothing else.  Wait
+ * for the IOP to reach ON, then send AP power ON and give its acknowledgment
+ * a short window; not every coprocessor sends it.
+ */
+static int apple_rtkit_boot_t6050(struct apple_rtkit *rtk, const int *endpoints,
+				  int nendpoints)
+{
+	static const u8 order[] = {
+		APPLE_RTKIT_EP_DEBUG, APPLE_RTKIT_EP_CRASHLOG, APPLE_RTKIT_EP_SYSLOG,
+		APPLE_RTKIT_EP_IOREPORT, APPLE_RTKIT_EP_OSLOG,
+	};
+	struct apple_mbox_msg msg;
+	int i, j, ret;
+
+	for (i = 0; i < ARRAY_SIZE(order); i++) {
+		for (j = 0; j < nendpoints && endpoints[j] != order[i]; j++)
+			;
+		if (j == nendpoints)
+			continue;
+
+		msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_STARTEP) |
+			FIELD_PREP(APPLE_RTKIT_MGMT_STARTEP_EP, order[i]) |
+			APPLE_RTKIT_MGMT_STARTEP_FLAG;
+		msg.msg1 = APPLE_RTKIT_EP_MGMT;
+		ret = mbox_send(rtk->chan, &msg);
+		if (ret < 0)
+			return ret;
+	}
+
+	rtk->iop_pwr = APPLE_RTKIT_PWR_STATE_SLEEP;
+	rtk->ap_pwr = APPLE_RTKIT_PWR_STATE_QUIESCED;
+
+	while (rtk->iop_pwr != APPLE_RTKIT_PWR_STATE_ON) {
+		ret = apple_rtkit_poll(rtk, TIMEOUT_1SEC_US);
+		if (ret < 0)
+			return ret;
+	}
+
+	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE) |
+		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_ON);
+	msg.msg1 = APPLE_RTKIT_EP_MGMT;
+	ret = mbox_send(rtk->chan, &msg);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < 4 && rtk->ap_pwr != APPLE_RTKIT_PWR_STATE_ON; i++) {
+		ret = apple_rtkit_poll(rtk, 50000);
+		if (ret == -ETIMEDOUT)
+			continue;
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+int apple_rtkit_boot_with_sys_ep_mask(struct apple_rtkit *rtk, u32 system_eps)
 {
 	struct apple_mbox_msg msg;
 	int endpoints[256];
@@ -297,9 +390,13 @@ int apple_rtkit_boot_state(struct apple_rtkit *rtk, int pwrstate)
 	u32 bitmap, base;
 	int i, ret;
 
-	/* Wakup the IOP. */
+	/*
+	 * Ask firmware to initialize after starting the coprocessor.  Linux uses
+	 * INIT rather than ON here; ON alone can complete the RTKit endpoint
+	 * handshake without starting the helper's application protocol.
+	 */
 	msg.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE) |
-		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, pwrstate);
+		FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_INIT);
 	msg.msg1 = APPLE_RTKIT_EP_MGMT;
 	ret = mbox_send(rtk->chan, &msg);
 	if (ret < 0)
@@ -386,16 +483,17 @@ wait_epmap:
 	if (reply & APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE)
 		goto wait_epmap;
 
+	if (of_machine_is_compatible("apple,t6050"))
+		return apple_rtkit_boot_t6050(rtk, endpoints, nendpoints);
+
 	for (i = 0; i < nendpoints; i++) {
-		endpoint = endpoints[i];
-		if (endpoint == APPLE_RTKIT_EP_MGMT ||
-		    endpoint == APPLE_RTKIT_EP_TRACEKIT)
+		/*
+		 * Start advertised system endpoints as Linux does. MTP waits for
+		 * them before announcing its DockChannel interfaces.
+		 */
+		if (endpoints[i] == APPLE_RTKIT_EP_MGMT)
 			continue;
-		if (pwrstate != APPLE_RTKIT_PWR_STATE_INIT &&
-		    (endpoint == APPLE_RTKIT_EP_SYSLOG ||
-		     endpoint == APPLE_RTKIT_EP_DEBUG))
-			continue;
-		if (pwrstate == APPLE_RTKIT_PWR_STATE_INIT && endpoint >= 0x20)
+		if (endpoints[i] < 32 && !(system_eps & BIT(endpoints[i])))
 			continue;
 
 		/* Request endpoint. */
@@ -411,7 +509,7 @@ wait_epmap:
 	rtk->iop_pwr = APPLE_RTKIT_PWR_STATE_SLEEP;
 	rtk->ap_pwr = APPLE_RTKIT_PWR_STATE_QUIESCED;
 
-	while ((rtk->iop_pwr & 0xff) != APPLE_RTKIT_PWR_STATE_ON) {
+	while (rtk->iop_pwr != APPLE_RTKIT_PWR_STATE_ON) {
 		ret = apple_rtkit_poll(rtk, TIMEOUT_1SEC_US);
 		if (ret < 0)
 			return ret;
@@ -422,7 +520,18 @@ wait_epmap:
 
 int apple_rtkit_boot(struct apple_rtkit *rtk)
 {
-	return apple_rtkit_boot_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+	return apple_rtkit_boot_with_sys_ep_mask(rtk, ~0U);
+}
+
+/*
+ * Our M5 NVMe code asks for an INIT boot, which is what apple_rtkit_boot()
+ * does; it never asks for anything else on a SoC that uses this tree.
+ */
+int apple_rtkit_boot_state(struct apple_rtkit *rtk, int pwrstate)
+{
+	if (pwrstate != APPLE_RTKIT_PWR_STATE_INIT)
+		printf("%s: booting with INIT, not %#x\n", __func__, pwrstate);
+	return apple_rtkit_boot(rtk);
 }
 
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, int pwrstate)
