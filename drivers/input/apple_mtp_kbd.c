@@ -13,6 +13,7 @@
 #include <asm/arch/rtkit.h>
 #include <asm/io.h>
 #include <linux/input.h>
+#include <asm/unaligned.h>
 #include "apple_kbd.h"
 
 struct apple_mtp_kbd_priv {
@@ -24,6 +25,7 @@ struct apple_mtp_kbd_priv {
 	u8 *init_data;
 	u32 init_size;
 	u32 fifo_size;
+	u8 tx_seq;
 };
 
 #define DATA_TX8		0x4
@@ -69,6 +71,48 @@ static int dockchannel_read(struct udevice *dev, void *buf, size_t size)
 	return ret;
 }
 
+static u32 mtp_checksum(const u8 *p, size_t len)
+{
+	u32 sum = 0;
+	size_t i;
+
+	for (i = 0; i + 4 <= len; i += 4)
+		sum += get_unaligned_le32(p + i);
+	return ~sum;
+}
+
+/*
+ * M5 (T8142): iBoot leaves the keyboard interface disabled, so nothing ever
+ * sends reports. Enable it as the OS driver does: a control message on the
+ * comm interface (0) carrying {CMD_ENABLE, iface}.
+ */
+static int mtp_enable_iface(struct udevice *dev, u8 iface)
+{
+	struct apple_mtp_kbd_priv *priv = dev_get_priv(dev);
+	u8 pkt[8 + 8 + 4 + 4] = { 0 };
+	size_t plen = 8 + 4, i;
+	ulong start;
+
+	pkt[0] = 8;			/* header length */
+	pkt[1] = 0x11;			/* host to device */
+	put_unaligned_le16(plen, pkt + 2);
+	pkt[4] = priv->tx_seq++;
+	pkt[5] = 0;			/* comm */
+	put_unaligned_le16(0x80, pkt + 8);	/* control */
+	put_unaligned_le16(2, pkt + 10);
+	pkt[16] = 0xb4;			/* CMD_ENABLE */
+	pkt[17] = iface;
+	put_unaligned_le32(mtp_checksum(pkt, 8 + plen), pkt + 8 + plen);
+	for (i = 0; i < 8 + plen + 4; i++) {
+		start = get_timer(0);
+		while (!readl(priv->local + DATA_TX_FREE))
+			if (get_timer(start) > 10)
+				return -ETIME;
+		writel(pkt[i], priv->local + DATA_TX8);
+	}
+	return 0;
+}
+
 static int apple_mtp_kbd_check(struct input_config *input)
 {
 	struct udevice *dev = input->dev;
@@ -103,12 +147,24 @@ static int apple_mtp_kbd_check(struct input_config *input)
 				return ret;
 		} else {
 			u8 *p = &priv->init_data[priv->init_size];
+			u8 *m = p + sizeof(hdr) + 8;
 
 			memcpy(p, &hdr, sizeof(hdr));
 			ret = dockchannel_read(dev, p + sizeof(hdr), hdr.length + 4);
 			if (ret < 0)
 				return ret;
+			/* Our own control acks are not for the next stage. */
+			if (hdr.length >= 8 &&
+			    get_unaligned_le16(p + sizeof(hdr)) == 0x80)
+				return 0;
 			priv->init_size += need;
+			/* The keyboard's last init message: enable it. */
+			if (hdr.length >= 8 + 22 && m[0] == 0xf0 && m[1] == 0x01 &&
+			    m[20] == 0 && !strncmp((char *)m + 4, "keyboard", 16)) {
+				ret = mtp_enable_iface(dev, m[3]);
+				printf("mtp: enabling keyboard (iface %u): %d\n",
+				       m[3], ret);
+			}
 		}
 	} else if (hdr.channel == 0x12 && hdr.length == 0x14) {
 		u8 buf[0x18];
