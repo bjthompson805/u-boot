@@ -14,6 +14,7 @@
 #include <reset.h>
 #include <linux/libfdt.h>
 
+#include <asm/global_data.h>
 #include <asm/io.h>
 #include <asm/arch/dart.h>
 #include <asm/arch/rtkit.h>
@@ -25,6 +26,8 @@
 #define  REG_CPU_CTRL_RUN	BIT(4)
 
 #define APPLE_RTKIT_EP_OSLOG 8
+
+DECLARE_GLOBAL_DATA_PTR;
 
 /*
  * Value of "apple,rtkit-handoff" on a helper the OS must adopt while it runs:
@@ -59,6 +62,9 @@ struct rtkit_helper_priv {
 	bool handoff_published;
 	const void *published_fdt;
 	bool input_ready;
+	/* M5: the helper, and the next free SRAM below its OSLog buffer */
+	struct udevice *self;
+	phys_addr_t sram_next;
 };
 
 /*
@@ -136,6 +142,27 @@ static void *rtkit_helper_alloc(struct rtkit_helper_priv *priv, size_t size)
 {
 	phys_addr_t addr;
 
+	/*
+	 * M5 (T8142): these buffers outlive U-Boot. Any range reserved out of
+	 * the OS memory map, anywhere in DRAM, keeps the display coprocessor
+	 * from booting under FreeBSD, so take them from the MTP's own SRAM,
+	 * downward from 64K below its top (the OSLog buffer takes the top).
+	 */
+	if (!priv->dma_end && of_machine_is_compatible("apple,t8142")) {
+		fdt_size_t sram_size;
+		fdt_addr_t sram;
+
+		sram = dev_read_addr_size_name(priv->self, "sram", &sram_size);
+		if (sram == FDT_ADDR_T_NONE)
+			return NULL;
+		if (!priv->sram_next)
+			priv->sram_next = sram + sram_size - SZ_64K;
+		addr = priv->sram_next - ALIGN(size, SZ_16K);
+		if (addr < sram + sram_size / 2)
+			return NULL;
+		priv->sram_next = addr;
+		return map_sysmem(addr, size);
+	}
 	if (!priv->dma_end)
 		return memalign(SZ_16K, ALIGN(size, SZ_16K));
 
@@ -224,6 +251,10 @@ static void shmem_destroy(void *cookie, struct apple_rtkit_buffer *buf) {
 	if (priv->handoff_published)
 		return;
 
+	/* M5: SRAM, nothing to give back. */
+	if (of_machine_is_compatible("apple,t8142"))
+		return;
+
 	if (priv->dma_end)
 		lmb_free(map_to_sysmem(buf->buffer), ALIGN(buf->size, SZ_16K),
 			 LMB_NOOVERWRITE);
@@ -280,6 +311,7 @@ static int rtkit_helper_probe(struct udevice *dev)
 	ctrl = readl(priv->asc + REG_CPU_CTRL);
 	writel(ctrl | REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);
 
+	priv->self = dev;
 	priv->rtk = apple_rtkit_init(&priv->chan, dev, shmem_setup, shmem_destroy);
 	if (!priv->rtk) {
 		ret = -ENOMEM;
@@ -575,7 +607,14 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 	}
 
 	fdt_delprop(blob, node, "memory-region");
-	for (i = 0; i < priv->nbufs; i++) {
+	/*
+	 * M5 (T8142): the buffers are in the MTP's SRAM (rtkit_helper_alloc()),
+	 * so there is no DRAM to reserve; any reservation keeps the display
+	 * coprocessor from booting under FreeBSD, which adopts the session
+	 * from the apple,rtkit-buffers inventory alone.
+	 */
+	for (i = 0; !of_machine_is_compatible("apple,t8142") &&
+		    i < priv->nbufs; i++) {
 		struct rtkit_helper_buf *b = &priv->bufs[i];
 
 		snprintf(name, sizeof(name), "mtp-rtkit@%llx", b->dva);
